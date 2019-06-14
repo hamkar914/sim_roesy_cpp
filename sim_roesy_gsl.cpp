@@ -234,8 +234,8 @@ int main (int argc, char *argv[])
         
         //------------ SINE T1 --------------
         // evolve A & B during t1 with sin term
-        double sin_evo_t1_a = sin(freq_a*2*M_PI*t1)*exp(-r2a*M_PI*t1);
-        double sin_evo_t1_b = sin(freq_b*2*M_PI*t1)*exp(-r2b*M_PI*t1);
+        double sin_evo_t1_a = sin(freq_a*2*M_PI*t1)*exp(-r2a*t1);
+        double sin_evo_t1_b = sin(freq_b*2*M_PI*t1)*exp(-r2b*t1);
         
         
         

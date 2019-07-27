@@ -3,11 +3,12 @@
  * dimensions and fft according to States-Haberkorn-Ruben. The idea is based on: Allard, P.,
  * Helgstand, M. and Hard, T., Journal of Magnetic Resonance, 129: 19-29 (1997). The code
  * aims to only use the functionalty provided by GSL as much as possible and is to a high
- * extent based on the examples provided by the GSL documentation.
+ * extent based on the examples provided by the GSL documentation. This version runs each 
+ * pair of t1 data points in separate threads.
  * 
  *  Compiled with: 
  *  ---------------
- *  g++ sim_roesy_gsl.cpp -lgsl -lcblas -Wall -O3
+ *  g++ sim_roesy_gsl.cpp -lgsl -lcblas -lpthread -Wall -O3
  *
  *  gnuplot script:
  *  --------------------
@@ -30,7 +31,23 @@
 #include <gsl/gsl_odeiv2.h>
 #include <gsl/gsl_fft.h>
 #include <gsl/gsl_fft_complex.h>
+#include <pthread.h>
 
+
+#define XPHASE 0.0
+#define YPHASE M_PI/2
+
+
+struct thread_data {
+   int f1_points;
+   int f2_points;
+   double *storage;
+   double *params;
+   double phase;
+};
+
+
+// https://www.tutorialspoint.com/cplusplus/cpp_multithreading.htm
 
 
 int allard97(double t, const double x[], double dmdt[], void *params)
@@ -149,6 +166,104 @@ void home_made_transpose(int rows, int cols, gsl_complex_packed_array r_array)
 }
 
 
+void *do_roesy_experiment(void *pns)
+{   
+    /* 
+    A function that does the whole roesy experiment;
+    t1 evolution + spin-lock + t2 + store all fids in memory.
+    To be called by pthread_create, recieves a void pointer
+    that is casted to struct pointer for accessing necessary
+    data.
+    */
+
+    struct thread_data *params_n_storage;
+    params_n_storage = (struct thread_data *) pns;
+    
+    int td_f1 = params_n_storage->f1_points;
+    int td_f2 = params_n_storage->f2_points;
+
+    double *fid_array = params_n_storage->storage;
+    double *parameters = params_n_storage->params;
+    double ph = params_n_storage->phase;
+    
+    double offset_a = parameters[0];
+    double r1a = parameters[1];
+    double r2a = parameters[2];
+    double offset_b = parameters[3];
+    double r1b = parameters[4];
+    double r2b = parameters[5];
+    double sl = parameters[6];
+    double sigma_z = parameters[7];
+    double sigma_xy = parameters[8];
+    double IN_F1 = parameters[9];
+    double IN_F2 = parameters[10]; 
+    double sl_time = parameters[11];
+    double RG = parameters[12];
+    double freq_a = parameters[13];
+    double freq_b = parameters[14];
+    
+    double theta_a = M_PI/2-atan(offset_a/sl);
+    double theta_b = M_PI/2-atan(offset_b/sl);
+
+    
+    for(int i = 0; i < td_f1/2; i++)
+    {
+        
+        // In this loop, do t1+spin-lock+t2
+
+        //------------ T1 -------------        
+        double t1 = i*IN_F1;    // t1 (s)
+        
+        //evolve A & B during t1 with, notice ph=phase term
+        double evo_t1_a = cos(freq_a*2*M_PI*t1-ph)*exp(-r2a*t1);
+        double evo_t1_b = cos(freq_b*2*M_PI*t1-ph)*exp(-r2b*t1);
+        
+        
+        //-------- SPIN-LOCK ----------
+        // evolved magnetization prior to spin-lock
+        double max_init_sl = evo_t1_a-M_PI/2;
+        double may_init_sl = sin(theta_a)*evo_t1_a;
+        double maz_init_sl = abs(cos(theta_a)*evo_t1_a);
+        double mbx_init_sl = evo_t1_b-M_PI/2;
+        double mby_init_sl = sin(theta_b)*evo_t1_b;
+        double mbz_init_sl = abs(cos(theta_b)*evo_t1_b);
+        
+        double mag_ab[6] = {max_init_sl, may_init_sl,
+                            maz_init_sl, mbx_init_sl,
+                            mby_init_sl, mbz_init_sl};
+                                           
+        double integration_params[9] = {offset_a, r1a, r2a, offset_b,
+        r1b, r2b, sl, sigma_z, sigma_xy};
+        
+        do_integration(sl_time, mag_ab, integration_params);
+        
+        //------------ T2 -------------
+        //store fids in the packed array allocated before
+        for (int j = 0; j < td_f2; j=j+2)
+        {
+            double t2 = j*IN_F2*0.5;
+            
+            double t2_fid_a_real = RG*mag_ab[1]*cos(freq_a*2*M_PI*t2)*exp(-r2a*2*M_PI*t2);
+            double t2_fid_b_real = RG*mag_ab[4]*cos(freq_b*2*M_PI*t2)*exp(-r2b*2*M_PI*t2);
+            
+            double t2_fid_a_imag = RG*mag_ab[1]*sin(freq_a*2*M_PI*t2)*exp(-r2a*2*M_PI*t2);
+            double t2_fid_b_imag = RG*mag_ab[4]*sin(freq_b*2*M_PI*t2)*exp(-r2b*2*M_PI*t2);
+            
+            // OBS!!! incrementing j by 2 to store real and imag part
+            // as pairs in packed array, the same goes for sine t2
+            
+            fid_array[i*td_f2+j] = t2_fid_a_real+t2_fid_b_real;
+            fid_array[i*td_f2+j+1] = t2_fid_a_imag+t2_fid_b_imag;
+        }
+        
+    }
+
+    return NULL;
+}
+
+   
+
+
 
 int main (int argc, char *argv[])
 {
@@ -198,8 +313,7 @@ int main (int argc, char *argv[])
     // reciever gain
     double RG = 6.0;
     
-    
-    
+
     // ------------------ EXPERIMENT --------------------
 
     double *sin_fids = NULL; 
@@ -210,107 +324,76 @@ int main (int argc, char *argv[])
     double offset_a = freq_a-O1;
     double offset_b = freq_b-O1;
 
-    double parameters[9] = {offset_a, r1a, r2a, offset_b,
-        r1b, r2b, sl, sigma_z, sigma_xy};
+    double parameters[15] = {offset_a, r1a, r2a, offset_b,
+        r1b, r2b, sl, sigma_z, sigma_xy, IN_F1, IN_F2, sl_time, RG, freq_a, freq_b};
     
- 
-    double theta_a = M_PI/2-atan(offset_a/sl);
-    double theta_b = M_PI/2-atan(offset_b/sl);
-    
-    
-    for(int i = 0; i < td_f1/2; i++)
-    {
-        
-        // In this loop, do t1+spin-lock+t2
-        
-        double t1 = i*IN_F1;    // t1 (s)
-        
 
-        //------------COSINE T1 -------------
-        //evolve A & B during t1 with cos term
-        double cos_evo_t1_a = cos(freq_a*2*M_PI*t1)*exp(-r2a*t1);
-        double cos_evo_t1_b = cos(freq_b*2*M_PI*t1)*exp(-r2b*t1);
-        
-        
-        //------------ SINE T1 --------------
-        // evolve A & B during t1 with sin term
-        double sin_evo_t1_a = sin(freq_a*2*M_PI*t1)*exp(-r2a*M_PI*t1);
-        double sin_evo_t1_b = sin(freq_b*2*M_PI*t1)*exp(-r2b*M_PI*t1);
-        
-        
-        
-        //-------- COSINE SPIN-LOCK ----------
-        // cos evolved magnetization prior to spin-lock
-        double max_init_sl_cos = sin_evo_t1_a;
-        double may_init_sl_cos = sin(theta_a)*cos_evo_t1_a;
-        double maz_init_sl_cos = abs(cos(theta_a)*cos_evo_t1_a);
-        double mbx_init_sl_cos = sin_evo_t1_b;
-        double mby_init_sl_cos = sin(theta_b)*cos_evo_t1_b;
-        double mbz_init_sl_cos = abs(cos(theta_b)*cos_evo_t1_b);
-        
-        double mag_ab_cos[6] = {max_init_sl_cos, may_init_sl_cos,
-                              maz_init_sl_cos, mbx_init_sl_cos,
-                              mby_init_sl_cos, mbz_init_sl_cos};
-        
-        do_integration(sl_time, mag_ab_cos, parameters);
-        
-        
-        //---------- SINE SPIN-LOCK ----------
-        // sin evolved magnetization prior to spin-lock
-        double max_init_sl_sin = cos_evo_t1_a;
-        double may_init_sl_sin = sin(theta_a)*sin_evo_t1_a;
-        double maz_init_sl_sin = abs(cos(theta_a)*sin_evo_t1_a);
-        double mbx_init_sl_sin = cos_evo_t1_b;
-        double mby_init_sl_sin = sin(theta_b)*sin_evo_t1_b;
-        double mbz_init_sl_sin = abs(cos(theta_b)*sin_evo_t1_b);
-        
-        double mag_ab_sin[6] = {max_init_sl_sin, may_init_sl_sin,
-                                maz_init_sl_sin, mbx_init_sl_sin,
-                                mby_init_sl_sin, mbz_init_sl_sin};
-        
-        do_integration(sl_time, mag_ab_sin, parameters);
-        
-        
-        
-        
-        //------------ COSINE T2 -------------
-        //store fids in the packed array allocated before
-        for (int j = 0; j < td_f2; j=j+2)
-        {
-            double t2 = j*IN_F2*0.5;
-            
-            double t2_cos_fid_a_real = RG*mag_ab_cos[1]*cos(freq_a*2*M_PI*t2)*exp(-r2a*2*M_PI*t2);
-            double t2_cos_fid_b_real = RG*mag_ab_cos[4]*cos(freq_b*2*M_PI*t2)*exp(-r2b*2*M_PI*t2);
-            
-            double t2_cos_fid_a_imag = RG*mag_ab_cos[1]*sin(freq_a*2*M_PI*t2)*exp(-r2a*2*M_PI*t2);
-            double t2_cos_fid_b_imag = RG*mag_ab_cos[4]*sin(freq_b*2*M_PI*t2)*exp(-r2b*2*M_PI*t2);
-            
-            // OBS!!! incrementing j by 2 to store real and imag part
-            // as pairs in packed array, the same goes for sine t2
-            
-            cos_fids[i*td_f2+j] = t2_cos_fid_a_real+t2_cos_fid_b_real;
-            cos_fids[i*td_f2+j+1] = t2_cos_fid_a_imag+t2_cos_fid_b_imag;
-        }
-        
-        
-        //------------- SINE T2 -------------
-        // store fids in packed array allocated before
-        for (int j = 0; j < td_f2; j=j+2)
-        {
-            double t2 = j*IN_F2*0.5;
-            
-            double t2_sin_fid_a_real = RG*mag_ab_sin[1]*cos(freq_a*2*M_PI*t2)*exp(-r2a*2*M_PI*t2);
-            double t2_sin_fid_b_real = RG*mag_ab_sin[4]*cos(freq_b*2*M_PI*t2)*exp(-r2b*2*M_PI*t2);
-            
-            double t2_sin_fid_a_imag = RG*mag_ab_sin[1]*sin(freq_a*2*M_PI*t2)*exp(-r2a*2*M_PI*t2);
-            double t2_sin_fid_b_imag = RG*mag_ab_sin[4]*sin(freq_b*2*M_PI*t2)*exp(-r2b*2*M_PI*t2);
-            
-            sin_fids[i*td_f2+j] = t2_sin_fid_a_real+t2_sin_fid_b_real;
-            sin_fids[i*td_f2+j+1] = t2_sin_fid_a_imag+t2_sin_fid_b_imag;
-        }
-        
-    }
+    // create two structs to hold data for different threads
+    thread_data x_phase_data;
     
+    x_phase_data.f1_points = td_f1;
+    x_phase_data.f2_points = td_f2;
+    x_phase_data.storage = cos_fids;
+    x_phase_data.params = parameters;
+    x_phase_data.phase = XPHASE;
+    
+    thread_data y_phase_data;
+    
+    y_phase_data.f1_points = td_f1;
+    y_phase_data.f2_points = td_f2;
+    y_phase_data.storage = sin_fids;
+    y_phase_data.params = parameters;
+    y_phase_data.phase = YPHASE;
+    
+    // create threads
+    pthread_t thd1;
+    pthread_t thd2;
+
+    pthread_attr_t attr;
+    void *status;
+
+    // Initialize and set thread joinable
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
+    
+    int rc;
+
+    rc = pthread_create(&thd1, &attr, do_roesy_experiment, (void *)&x_phase_data);
+      
+    if (rc) 
+    {
+        std::cout << "Error:unable to create thread," << rc << std::endl;
+        exit(-1);
+    }
+
+    rc = pthread_create(&thd2, &attr, do_roesy_experiment, (void *)&y_phase_data);
+      
+    if (rc) 
+    {
+        std::cout << "Error:unable to create thread," << rc << std::endl;
+        exit(-1);
+    }
+
+    // free attribute and wait for the other threads
+    pthread_attr_destroy(&attr);
+
+    //pthread_exit(NULL);
+
+    rc = pthread_join(thd1, &status);
+    if (rc)
+    {
+        std::cout << "Error:unable to join," << rc << std::endl;
+        exit(-1);
+    }
+
+    rc = pthread_join(thd2, &status);
+    if (rc)
+    {
+        std::cout << "Error:unable to join," << rc << std::endl;
+        exit(-1);
+    }
+
+
 
     // Apply window function in f2 dimension
 
@@ -417,7 +500,5 @@ int main (int argc, char *argv[])
     delete cos_fids;
 
     return 0;
+
 }
-
-
-
